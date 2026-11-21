@@ -2,12 +2,12 @@
 
 Inspect the HTTP security headers of a URL.
 
-`headercheck` sends a single GET request to a URL you give it, reads the
+`headercheck` sends a GET request to a URL you give it (following redirects), reads the
 response headers, and reports which security headers are present, which
 are missing, and what each one does. It prints a score out of 100 with a
 letter grade.
 
-It is read-only. It sends one request and nothing else: no scanning, no
+It is read-only. It sends GET requests only and nothing else: no scanning, no
 probing, no brute forcing. Point it at sites you own or have permission
 to test.
 
@@ -74,7 +74,7 @@ For comparison, `github.com` scores 90/100 (A).
 
 ## How it works
 
-One GET request with a `headercheck` user agent. Redirects are followed
+Plain GET requests with a `headercheck` user agent. Redirects are followed
 up to 5 times and the final URL is reported. The analysis is pure
 functions over the response headers (`analyze()`), which is what the
 tests exercise; the network part is a thin wrapper around
