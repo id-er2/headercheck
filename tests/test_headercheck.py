@@ -325,5 +325,26 @@ class CliTests(unittest.TestCase):
         self.assertEqual(rc, 2)
 
 
+class TerminalSafetyTests(unittest.TestCase):
+    def test_report_strips_ansi_from_header_values(self):
+        c = hc.Check("Server", "info", 0, 0, "server header present",
+                     "value: nginx/1.25\x1b[2J\x1b[31m", None)
+        out = hc.format_report(HTTPS, HTTPS, [c], 100, "A+")
+        self.assertNotIn("\x1b", out)
+        self.assertIn("nginx/1.25", out)
+
+    def test_header_values_cannot_inject_report_lines(self):
+        c = hc.Check("X-Test", "warn", 1, 0, "odd value",
+                     "x\r\n  Score: 100/100 (A+)", None)
+        out = hc.format_report(HTTPS, HTTPS, [c], 0, "F")
+        score_lines = [l for l in out.splitlines()
+                       if l.startswith("  Score:")]
+        self.assertEqual(len(score_lines), 1)
+        self.assertIn("0/100", score_lines[0])
+
+    def test_strip_ctl_removes_bell_and_delete(self):
+        self.assertEqual(hc._strip_ctl("a\x07b\x7fc"), "abc")
+
+
 if __name__ == "__main__":
     unittest.main()

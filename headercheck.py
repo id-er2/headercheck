@@ -13,6 +13,7 @@ Usage:
 
 import argparse
 import json
+import re
 import ssl
 import sys
 import urllib.error
@@ -34,6 +35,22 @@ GRADES = [
 
 HSTS_ONE_YEAR = 31536000
 HSTS_SIX_MONTHS = 15552000
+
+# ANSI escape sequences (CSI, plus two-character ESC sequences).
+_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-Z\\-_]")
+
+
+def _strip_ctl(text):
+    """Remove ANSI escapes and control characters from untrusted text.
+
+    Response header values come from the server being checked and can
+    contain terminal escape sequences or raw control characters. They are
+    stripped at the text-report boundary so a crafted server response
+    cannot rewrite, clear or recolor the terminal that displays the
+    report. JSON output keeps the raw values.
+    """
+    text = _ANSI_RE.sub("", str(text))
+    return "".join(ch for ch in text if ch >= " " and ch != "\x7f")
 
 
 class Check:
@@ -464,7 +481,7 @@ def format_report(url, final_url, status_checks, score, grade):
         if c.fix:
             lines.append("        Fix: %s" % c.fix)
         lines.append("")
-    return "\n".join(lines).rstrip() + "\n"
+    return "\n".join(_strip_ctl(line) for line in lines).rstrip() + "\n"
 
 
 def main(argv=None):
