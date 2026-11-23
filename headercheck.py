@@ -12,12 +12,17 @@ Usage:
 """
 
 import argparse
+import ipaddress
+import http.client
 import json
 import re
+import socket
 import ssl
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
+from contextlib import contextmanager
 
 USER_AGENT = "headercheck/1.0 (+https://github.com/id-er2/headercheck)"
 REQUEST_TIMEOUT = 15
@@ -77,6 +82,55 @@ class Check:
         }
 
 
+class FetchPolicyError(RuntimeError):
+    """The URL or a redirect target violates the fetch policy."""
+
+
+def _check_fetch_url(url, initial=False):
+    """Validate a URL the tool is about to fetch.
+
+    Only http and https are ever fetched (no file:, ftp: or other
+    schemes urllib would happily open). Redirect targets must also
+    resolve to public addresses only, so a server cannot bounce the
+    checker at loopback, link-local or private-network services. The
+    address the user typed is exempt from the address check: inspecting
+    one's own internal site is a legitimate use.
+    """
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme not in ("http", "https"):
+        raise FetchPolicyError(
+            "refusing to fetch scheme %r: only http and https"
+            % (parts.scheme or "(none)"))
+    host = parts.hostname
+    if not host:
+        raise FetchPolicyError("URL has no host: %r" % url)
+    if initial:
+        return
+    try:
+        infos = socket.getaddrinfo(
+            host,
+            parts.port or (443 if parts.scheme == "https" else 80),
+            proto=socket.IPPROTO_TCP)
+    except socket.gaierror as exc:
+        raise FetchPolicyError(
+            "redirect target %r does not resolve: %s" % (host, exc))
+    if not infos:
+        raise FetchPolicyError("redirect target has no addresses")
+    for info in infos:
+        addr = info[4][0].split("%")[0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            raise FetchPolicyError(
+                "cannot parse resolved address %r" % (addr,))
+        if not ip.is_global or ip.is_multicast:
+            raise FetchPolicyError(
+                "refusing redirect to a non-public address: "
+                "%r resolves to %s" % (host, addr))
+
+    return infos
+
+
 def normalize_url(url):
     """Add a scheme when the user leaves it out."""
     url = url.strip()
@@ -87,39 +141,67 @@ def normalize_url(url):
     return url
 
 
-def fetch_headers(url, timeout=REQUEST_TIMEOUT):
-    """Fetch response headers with one GET request. Returns (final_url, headers).
-
-    headers is a dict with lower-case keys. Redirects are followed up to
-    MAX_REDIRECTS times.
-    """
-    headers = {}
-    current = url
-    context = ssl.create_default_context()
-    redirects = 0
-    while True:
-        request = urllib.request.Request(
-            current, headers={"User-Agent": USER_AGENT}, method="GET"
-        )
+def _connect_validated(infos, port, timeout):
+    """Connect directly to a validated sockaddr without a second DNS lookup."""
+    last_error = None
+    for family, socktype, proto, _, sockaddr in infos:
+        sock = socket.socket(family, socktype, proto)
         try:
-            with urllib.request.urlopen(
-                request, timeout=timeout, context=context
-            ) as response:
-                headers = _headers_dict(response.headers)
-                return response.geturl(), headers
-        except urllib.error.HTTPError as exc:
-            # 3xx without the default redirect handler, or an HTTP error
-            # status: headers are still worth reading.
-            if exc.code in (301, 302, 303, 307, 308) and "location" in exc.headers:
-                if redirects >= MAX_REDIRECTS:
-                    raise RuntimeError("too many redirects (limit %d)" % MAX_REDIRECTS)
-                current = urllib.request.urljoin(current, exc.headers["location"])
-                redirects += 1
-                continue
-            headers = _headers_dict(exc.headers) if exc.headers else {}
-            if headers:
-                return current, headers
-            raise RuntimeError("HTTP error %s from %s" % (exc.code, current))
+            sock.settimeout(timeout)
+            sock.connect((sockaddr[0], port) + sockaddr[2:])
+            return sock
+        except OSError as exc:
+            last_error = exc
+            sock.close()
+    raise last_error or OSError("no validated address available")
+
+
+@contextmanager
+def _open_response(url, timeout, infos=None):
+    parts = urllib.parse.urlsplit(url)
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    if parts.scheme == "https":
+        conn = http.client.HTTPSConnection(
+            parts.hostname, port, timeout=timeout,
+            context=ssl.create_default_context())
+    else:
+        conn = http.client.HTTPConnection(parts.hostname, port, timeout=timeout)
+    if infos is not None:
+        # Keep the original host for Host, TLS SNI and certificate checks;
+        # only the TCP connection uses the previously validated address.
+        conn._create_connection = lambda address, timeout, source_address=None: (
+            _connect_validated(infos, port, timeout))
+    path = urllib.parse.urlunsplit(("", "", parts.path or "/", parts.query, ""))
+    try:
+        conn.request("GET", path, headers={"User-Agent": USER_AGENT})
+        response = conn.getresponse()
+        try:
+            yield response
+        finally:
+            response.close()
+    finally:
+        conn.close()
+
+
+def fetch_headers(url, timeout=REQUEST_TIMEOUT):
+    """GET headers, manually validating each redirect before connecting.
+
+    Direct connections avoid proxy and automatic redirect behavior. The
+    user-selected first target may be internal. Redirect addresses must
+    all be public and are pinned for the connection, including HTTPS.
+    """
+    current = url
+    for redirects in range(MAX_REDIRECTS + 1):
+        infos = _check_fetch_url(current, initial=(redirects == 0))
+        with _open_response(current, timeout, infos) as response:
+            if response.status in (301, 302, 303, 307, 308):
+                location = response.headers.get("location")
+                if location:
+                    if redirects >= MAX_REDIRECTS:
+                        raise FetchPolicyError("too many redirects (limit %d)" % MAX_REDIRECTS)
+                    current = urllib.parse.urljoin(current, location)
+                    continue
+            return current, _headers_dict(response.headers)
 
 
 def _headers_dict(message):
@@ -502,7 +584,8 @@ def main(argv=None):
         return 2
     try:
         final_url, headers = fetch_headers(url, timeout=args.timeout)
-    except (urllib.error.URLError, RuntimeError, ssl.SSLError, OSError) as exc:
+    except (urllib.error.URLError, RuntimeError, FetchPolicyError,
+            ssl.SSLError, OSError, ValueError, http.client.HTTPException) as exc:
         print("error: could not fetch %s: %s" % (url, exc), file=sys.stderr)
         return 1
 

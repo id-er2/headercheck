@@ -1,6 +1,8 @@
 import io
 import json
+import socket
 import unittest
+import urllib.error
 from email.message import Message
 from unittest import mock
 
@@ -344,6 +346,88 @@ class TerminalSafetyTests(unittest.TestCase):
 
     def test_strip_ctl_removes_bell_and_delete(self):
         self.assertEqual(hc._strip_ctl("a\x07b\x7fc"), "abc")
+
+
+class FetchPolicyTests(unittest.TestCase):
+    PUBLIC_INFO = [(socket.AF_INET, socket.SOCK_STREAM, 6, "",
+                    ("93.184.216.34", 443))]
+    PRIVATE_INFO = [(socket.AF_INET, socket.SOCK_STREAM, 6, "",
+                     ("169.254.169.254", 80))]
+
+    def test_non_http_schemes_refused(self):
+        for url in ["file:///etc/passwd", "ftp://example.com/x",
+                    "gopher://example.com"]:
+            with self.assertRaises(hc.FetchPolicyError):
+                hc._check_fetch_url(url, initial=True)
+
+    def test_initial_private_address_allowed_without_resolution(self):
+        # the user's own internal site is a legitimate first target
+        with mock.patch.object(hc.socket, "getaddrinfo",
+                               side_effect=AssertionError("must not resolve")):
+            hc._check_fetch_url("http://192.168.1.1/", initial=True)
+
+    def test_redirect_to_private_address_refused(self):
+        with mock.patch.object(hc.socket, "getaddrinfo",
+                               return_value=self.PRIVATE_INFO):
+            with self.assertRaises(hc.FetchPolicyError):
+                hc._check_fetch_url("http://metadata.internal/latest",
+                                    initial=False)
+
+    def test_redirect_to_public_address_allowed(self):
+        with mock.patch.object(hc.socket, "getaddrinfo",
+                               return_value=self.PUBLIC_INFO):
+            hc._check_fetch_url("https://example.com/", initial=False)
+
+    def test_fetch_headers_blocks_private_redirect_target(self):
+        response = mock.MagicMock()
+        response.status = 301
+        response.headers = {"location": "http://169.254.169.254/latest/meta-data"}
+        with mock.patch.object(hc, "_open_response") as opened, \
+             mock.patch.object(hc.socket, "getaddrinfo", return_value=self.PRIVATE_INFO):
+            opened.return_value.__enter__.return_value = response
+            with self.assertRaises(hc.FetchPolicyError):
+                hc.fetch_headers("https://example.com/")
+            self.assertEqual(opened.call_count, 1)
+
+    def test_fetch_headers_blocks_scheme_redirect_target(self):
+        response = mock.MagicMock()
+        response.status = 302
+        response.headers = {"location": "file:///etc/passwd"}
+        with mock.patch.object(hc, "_open_response") as opened:
+            opened.return_value.__enter__.return_value = response
+            with self.assertRaises(hc.FetchPolicyError):
+                hc.fetch_headers("https://example.com/")
+            self.assertEqual(opened.call_count, 1)
+
+    def test_validated_connect_does_not_resolve_again(self):
+        with mock.patch.object(hc.socket, "socket") as sock, \
+             mock.patch.object(hc.socket, "getaddrinfo", side_effect=AssertionError("DNS twice")):
+            hc._connect_validated(self.PUBLIC_INFO, 443, 2)
+            sock.return_value.connect.assert_called_once_with(("93.184.216.34", 443))
+
+    def test_real_redirect_handler_cannot_bypass_policy(self):
+        import http.server
+        import threading
+        visits = []
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                visits.append(self.path)
+                self.send_response(302)
+                self.send_header("Location", "/private")
+                self.end_headers()
+            def log_message(self, *args):
+                pass
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            with self.assertRaises(hc.FetchPolicyError):
+                hc.fetch_headers("http://127.0.0.1:%d/start" % server.server_port)
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join()
+        self.assertEqual(visits, ["/start"])
 
 
 if __name__ == "__main__":
